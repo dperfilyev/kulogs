@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+import subprocess
+import asyncio
+import json
+import logging
+import errno
+import re
+import argparse
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
+import aiohttp
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO);
+log = logging.getLogger('kulogs');
+args = '';
+conf = {} ;
+
+CONFIG_PATH = Path("client_config.json")
+
+def load_config():
+  if CONFIG_PATH.is_file():
+    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+  else:
+    return {};
+
+def get_servers():
+  servers = []
+  try:
+    if args.stdin :
+       data = json.loads(sys.stdin.read());
+    else:
+       result = subprocess.run(
+         [ 'kubectl', 'get', 'pods', '-n', 'kulogsd', '-o', 'json' ],
+         capture_output=True,
+         text=True,
+         check=True
+       )
+       data = json.loads(result.stdout);
+    for item in data.get("items", []):
+        metadata = item.get("metadata", {})
+        spec = item.get("spec", {})
+        status = item.get("status", {})
+        e={};
+        e['pod_name']=metadata.get("name", "Unknown"); 
+        e['node_name']=spec.get("nodeName", "N/A");
+        e['phase']=status.get("phase", "Unknown");
+        e['pod_ip']=status.get("podIP", "N/A");
+        servers.append(e);
+  except subprocess.CalledProcessError as e:
+    log.error(f"ERROR kubectl: {e.stderr.strip()}")
+  except json.JSONDecodeError as e:
+    log.error(f"ERROR JSON: {e}")
+  except Exception as e:
+    log.error(f"ERROR unknown {e}")
+
+
+  if conf['backup_ip'] :
+    log.info(f"backup_ip {conf['backup_ip']}")
+    e={}
+    e['pod_name']="backup"
+    e['node_name']="backup"
+    e['phase']="backup"
+    e['pod_ip']=conf['backup_ip']
+    servers.append(e);
+ 
+  return servers
+
+def sort_via_cli(path_str):
+    path = Path(path_str).resolve()
+
+    output_path = path.with_name(path.name + ".sort")
+
+    with open(output_path, "wb") as f_out:
+        result = subprocess.run(
+            ["sort", "-o", str(output_path), str(path)],
+            stdout=f_out,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+    if result.returncode != 0: 
+        if output_path.exists():
+            output_path.unlink()
+        raise RuntimeError(f"sort error: {result.stderr.strip()}")
+
+    path.unlink()
+    output_path.rename(output_path.with_suffix(''))
+
+async def fetch_from_server( session, name, base_url,
+                             endpoint, payload, timeout):
+    url = f"{base_url.rstrip('/')}{endpoint}"
+    result = {
+        "server": name,
+        "url": url,
+        "success": False,
+        "error": None,
+    }
+
+    try:
+        async with session.post(
+            url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(connect=timeout['connect'], sock_read=timeout['sock_read']),
+        ) as resp:
+            if args.file_info :
+               data = await resp.json()
+               result["success"] = True
+               result["result"] = data
+            else :
+              result["output_fime_name"] = conf['out_dir']+"/"+name.split(':')[0]+".log"
+              result['bytes_read'] = 0;
+              with open(result["output_fime_name"],"wb") as f:
+                while l:= await resp.content.readline() :
+                  f.write(l)
+                  result['bytes_read'] += len(l);
+              result["success"] = True
+    except asyncio.TimeoutError as e:
+        result["error"] = f"timeout after {timeout}s"
+        log.warning("Timeout fetching %s (%s): %s", name, url, e)
+    except aiohttp.ClientConnectorError as e:
+        if getattr(e.os_error, 'errno', None) == errno.ECONNREFUSED:
+          result["error"] = f"connection refused"
+          log.warning("connection refused %s (%s): %s", name, url, e)
+        elif getattr(e.os_error, 'errno', None) == errno.ENOENT: 
+          result["error"] = f"system error: ENOENT "
+          log.warning("System error: ENOENT  %s (%s): %s", name, url, e)
+        else:
+          result["error"] = f"error: {e.os_error} "
+          log.warning("Error: {e.os_error}  %s (%s): %s", name, url, e)
+    except Exception as e:
+        result["error"] = str(e)
+        log.exception("Error fetching %s (%s)", name, url)
+
+    return result
+
+async def request_all_servers( servers, endpoint, payload, timeout):
+    connector = aiohttp.TCPConnector(limit=100)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            fetch_from_server(
+                session,
+                srv["name"],
+                srv["url"],
+                endpoint,
+                payload,
+                timeout,
+            )
+            for srv in servers
+        ]
+        results = await asyncio.gather(*tasks)
+    return list(results)
+
+def print_results(results):
+    res={ 'servers': [] }
+    for r in results:
+        ip = re.search(r'^http://(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+', r['url']).group(1);
+        a = r
+        a['ip'] = ip
+        a['server_name'] = a['server'].split(':')[0]
+        if r["success"]:
+          a['status'] = 'OK'
+          print(f"{a['server_name']} {a['status']} {a['bytes_read']:>10} bytes")
+        else:
+          a['status'] = 'FAILED'
+          print(f"{a['server_name']} {a['status']} {a['error']}")
+        res['servers'].append(a)
+    with open(conf["out_dir"]+"/"+"servers_status.json","w") as f:
+        f.write(json.dumps(res))
+
+def parse_time(time_str):
+    formats = [
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(time_str, fmt)
+        except ValueError:
+            continue
+    
+    raise argparse.ArgumentTypeError(
+        f"Illegal time format: '{time_str}'. "
+        f"Expected: YYYY-MM-DD [HH:MI[:SS]]"
+    )
+
+def parse_start_time(time_str):
+  return parse_time(time_str)
+
+def parse_end_time(time_str):
+  return parse_time(time_str)
+
+async def main():
+    global args, conf;
+    config = load_config()
+    conf['timeout'] = config.get("timeout", {
+                                      "connect" : 10,
+                                      "sock_read" : 120
+                                 })
+    conf['backup_ip'] = config.get("backup_ip", '')
+    conf['out_dir'] = config.get("out_dir", 'out')
+
+    parser = argparse.ArgumentParser( description="Collect pod's logs")
+
+    parser.add_argument(
+        "-e", "--end_time", 
+        type=parse_end_time,
+        help="End time (Cannot be used without --start-time.) 'YYYY-MM-DD [HH42[:MI[:SS]]]'"
+    )
+
+    parser.add_argument(
+        "-i", "--stdin", 
+        action="store_true",
+        help="Get kubectl output from stdin"
+    )
+
+    parser.add_argument(
+        "--file_info", 
+        action="store_true",
+        help="Get files info (JSON)"
+    )
+
+    parser.add_argument(
+        "-n", "--namespace", 
+        type=str,
+        required=True,
+        help="The namespace scope for the request"
+    )
+
+    parser.add_argument(
+        "-o", "--out_dir", 
+        type=str,
+        required=False,
+        help="Diretory for results ( default: ./out )"
+    )
+
+    parser.add_argument(
+        "-p", "--pod_prefix", 
+        type=str,
+        required=True,
+        help="Prefix for the pod name"
+    )
+
+    parser.add_argument(
+        "-s", "--start_time", 
+        type=parse_start_time,
+        help="Start time 'YYYY-MM-DD [HH42[:MI[:SS]]]'"
+    )
+
+    args = parser.parse_args()
+
+    payload = {
+        "files": ["file1.txt", "file2.bin"],
+        "ns": args.namespace ,
+        "pod_prefix": args.pod_prefix ,
+        "extra_param": "test_value",
+    }
+    if args.end_time :
+       if args.start_time :
+         payload['end_time'] = int(args.end_time.timestamp())
+       else :
+         parser.error('start_time MUST be specified with end_time')
+
+    if args.file_info :
+       payload['file_info'] = 1
+
+    if args.out_dir :
+       conf['out_dir'] = args.out_dir
+    if Path(conf['out_dir']).exists():
+      log.error(f"Error: directory {conf['out_dir']} already exists!")
+      sys.exit(1);
+    try:
+      Path(conf['out_dir']).mkdir()
+    except Exception as e:
+      log.error(f"Error: Cann't create directory {conf['out_dir']} : {e}")
+      sys.exit(1);
+
+    if args.start_time :
+       payload['start_time'] = int(args.start_time.timestamp())
+
+
+    servers = get_servers();
+
+#    for server in servers:
+#      print(f"{server}")
+
+    pod_ips = [ { 'url': 'http://'+e["pod_ip"]+':8080',
+                  'name': e['node_name']+":"+e['pod_name'] } for e in servers]
+
+    if not pod_ips:
+        log.error("No pods found")
+        return
+
+    endpoint = "/get"
+    log.info("Requesting endpoint %s from %d servers with timeout %ss",
+             endpoint, len(pod_ips), conf['timeout'])
+
+    results = await request_all_servers(pod_ips, endpoint, payload, conf['timeout'])
+
+    for r in results :
+      if r['success'] :
+        sort_via_cli(r['output_fime_name'])
+
+    print_results(results)
+
+if __name__ == "__main__":
+    asyncio.run(main())

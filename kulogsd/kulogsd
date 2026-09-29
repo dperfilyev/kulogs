@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+import asyncio
+import json
+import glob
+import sys
+import os
+import subprocess
+import re
+from datetime import datetime
+import logging
+from pathlib import Path
+from aiohttp import web
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger('kulogsd')
+conf = {} ;
+
+CONFIG_PATH = Path("kulogsd_config.json")
+date_pattern = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)((?:[+-]\d{2}:\d{2}|Z))')
+
+sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+
+def load_config():
+  if CONFIG_PATH.is_file():
+    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+  else:
+    return {};
+
+def parse_epoch(line):
+    match = date_pattern.match(line)
+    if not match:
+        return None
+
+    date_str = match.group(1)+match.group(2)
+    dt = datetime.fromisoformat(date_str)
+    return int(dt.timestamp())
+
+def find_datetime_offset( file_path, target_dt ):
+
+    file_size = os.path.getsize(file_path)
+    low = 0;
+    high = file_size;
+    return_offset = high ;
+    current_offset = 0 ;
+
+    with open(file_path, "r", encoding='latin-1') as f: # we don't need text, so 'latin-1' more safe than 'utf-8'
+      while low < high:
+        mid = (low + high) // 2;
+#        log.info(f"low = {low} high = {high} mid = {mid} return_offset = {return_offset}")
+        f.seek(mid);
+      
+        if mid != 0 : # if reached the first line, skip readline
+          f.readline();
+        current_offset = f.tell()
+        current_line = f.readline(); # TODO is it needed to handle EOF ?
+      
+      
+        line_dt = parse_epoch(current_line)
+#        print(f"current_offset = {current_offset} current_line = {current_line.rstrip('\n')} line_dt = {line_dt}")
+      
+        if line_dt :
+          if line_dt >= target_dt:
+            return_offset = current_offset
+            high = mid
+          else:
+            low = mid + 1
+        else:
+            high = mid
+    return return_offset
+
+def find_log_bounds( file_path, dt_start, dt_end ):
+
+    start_offset = find_datetime_offset(file_path, dt_start )
+
+    end_offset = find_datetime_offset(file_path, dt_end )
+
+    return start_offset, end_offset
+
+
+async def handle_info(request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    log.info("INFO request received, data=%s", data)
+    await asyncio.sleep(5)
+
+    response_data = {
+        "type": "INFO",
+        "params": data,
+        "message": "INFO processed after 5s delay",
+    }
+    return web.json_response(response_data)
+
+async def handle_get(request):
+    try:
+        data = await request.json()
+    except exception:
+        data = {}
+
+    log.info("get request received, data=%s", data)
+
+    response = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={'Content-Type': 'application/json; charset=utf-8'},
+    )
+    response.enable_chunked_encoding()
+    await response.prepare(request)
+
+    file_info_res = {}
+    for pattern in [conf['pods_dir']+'/'+data['ns']+'_'+data['pod_prefix']+'*/*/[0-9]*.log',
+                    conf['pods_dir']+'/'+data['ns']+'_'+data['pod_prefix']+'*/*/[0-9]*.log.[0-9]*-*[0-9]',  #0.log.20260904-142556
+                    conf['pods_dir']+'/'+data['ns']+'_'+data['pod_prefix']+'*/*/[0-9]*.log.[0-9]*-*[0-9].gz']: #0.log.20260904-142556.gz
+      for file_path in glob.glob(pattern):
+        f,t = get_first_and_last_epoch_with_cache(file_path) 
+        matched = True
+        if 'start_time' in data :
+          if 'end_time' not in data :
+            data['end_time'] = datetime.now().timestamp()
+          matched = overlap_time_intervals([data['start_time'],data['end_time']],[f,t])
+        log.info(f"file {file_path} from time {f} end time {t} matched {matched}")
+        if ( 'file_info' in data and data['file_info'] == 1 ) :
+            file_info_res.setdefault('files', []).append({ 'path': file_path,
+                                                    'start': f,
+                                                    'end': t,
+                                                    'matched': False if matched is None else True })
+        else :
+          if matched :
+            file_to_process = file_path
+            tmp_file = ""
+            if file_path.endswith(".gz") :
+              gziped_file = Path(file_path).resolve()
+              print(f"ungip {file_path}")
+              tmp_file = gziped_file.parent / "kubelogs_tmp_file"
+              unzip_via_cli_gzip(file_path, str(tmp_file))
+              start_time,end_time = get_first_and_last_epoch(tmp_file)
+              file_to_process = tmp_file.as_posix()
+
+            with open(file_to_process, 'rb') as f:
+              s,e = find_log_bounds( file_to_process, data['start_time'] , data['end_time'] )
+              file_size = os.path.getsize(file_to_process)
+              f.seek(s)
+              log.info(f"sending file {file_path} start offset {s} end offset {e} file size {file_size}")
+              while s < e :
+                c = e - s if s + 4096 > e else 4096
+                await response.write(f.read(c))
+                s += c
+
+            if file_path.endswith(".gz") :
+              tmp_file.unlink()
+          else :
+              log.info(f"skipping file {file_path}")
+
+    if ( 'file_info' in data and data['file_info'] == 1 ) :
+      await response.write(json.dumps(file_info_res).encode())
+    return response
+
+async def handle_health(request):
+    log.info("health request received")
+
+    response_data = {
+        "type": "health",
+        "message": "I'm healthy",
+    }
+    return web.json_response(response_data)
+
+def overlap_time_intervals(int1,int2):
+   a = int1 + int2;
+   a.sort();
+   if ( a[1] == int1[1] and a[2] == int2[0] ) or ( a[1] == int2[1] and a[2] == int1[0] ):
+      return None
+   return [ a[1], a[2] ]
+
+def get_first_and_last_epoch(file_path):
+
+    first_epoch = None
+    last_epoch = None
+
+    with open(file_path, 'rb') as f:
+        first_line = f.readline().decode('utf-8', errors='ignore')
+        if first_line:
+            first_epoch = parse_epoch(first_line)
+
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+
+        if file_size == 0:
+            return first_epoch, first_epoch
+
+        block_size = 4096
+        offset = 0
+        last_line_data = bytearray()
+        newline_count = 0
+
+        while True:
+            offset += block_size
+            if offset >= file_size:
+                f.seek(0)
+                chunk = f.read(file_size - (offset - block_size))
+                last_line_data = chunk + last_line_data
+                break
+
+            f.seek(file_size - offset)
+            chunk = f.read(block_size)
+            last_line_data = chunk + last_line_data
+
+            newline_count += chunk.count(b'\n')
+
+            if newline_count >= 2 or (newline_count == 1 and not last_line_data.endswith(b'\n')):
+                break
+
+        lines = last_line_data.decode('utf-8', errors='ignore').splitlines()
+
+        for line in reversed(lines):
+            if line.strip():
+                last_epoch = parse_epoch(line)
+                if last_epoch is not None:
+                    break
+
+    if last_epoch is None:
+        last_epoch = first_epoch
+
+    return first_epoch, last_epoch
+
+def unzip_via_cli_gzip(gz_path_str, output_name):
+    gz_path = Path(gz_path_str).resolve()
+
+    output_path = gz_path.parent / output_name
+
+    with open(output_path, "wb") as f_out:
+        result = subprocess.run(
+            ["gzip", "-d", "-c", str(gz_path)],
+            stdout=f_out,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+    if result.returncode != 0:
+        if output_path.exists():
+            output_path.unlink()
+        raise RuntimeError(f"gzip error: {result.stderr.strip()}")
+
+def get_first_and_last_epoch_with_cache(file_path_str):
+    target_file = Path(file_path_str).resolve()
+
+    if not target_file.is_file():
+        raise FileNotFoundError(f"File {target_file} not found.")
+
+    directory = target_file.parent
+    meta_file = directory / "kubelogs.meta"
+
+    file_name = target_file.name
+    current_mtime = int(target_file.stat().st_mtime)
+    current_size = target_file.stat().st_size
+
+
+    cache = {}
+    if meta_file.exists():
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except json.JSONDecodeError:
+            cache = {}
+
+    if file_name in cache:
+        cached_data = cache[file_name]
+        if cached_data.get("mtime") == current_mtime and cached_data.get("size") == current_size:
+            print(f"file {file_name} return CACHED times")
+            return cached_data["start_time"],cached_data["end_time"]
+
+    if file_path_str.endswith(".gz") :
+      print(f"file {file_name} create GZNEW entry ")
+      tmp_file = target_file.parent / "kubelogs_tmp_file"
+      unzip_via_cli_gzip(file_path_str, str(tmp_file))
+      start_time,end_time = get_first_and_last_epoch(tmp_file)
+      tmp_file.unlink()
+    else :
+      print(f"file {file_name} create NEW entry ")
+      start_time,end_time = get_first_and_last_epoch(file_path_str)
+  
+    cache[file_name] = {
+        "mtime": current_mtime,
+        "size": current_size,
+        "start_time": start_time,
+        "end_time": end_time
+    }
+
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=4)
+
+    return start_time,end_time
+
+async def main():
+    global conf;
+    config = load_config()
+
+    conf['host'] = config.get("host", "127.0.0.1")
+    conf['port'] = config.get("port", 8080)
+    conf['pods_dir'] = config.get("pods_dir", '/var/log/pods')
+
+    app = web.Application()
+    app.router.add_route("GET", "/health", handle_health)
+    app.router.add_route("POST", "/info", handle_info)
+    app.router.add_route("POST", "/get", handle_get)
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, conf['host'], conf['port'])
+    await site.start()
+
+    log.info("Server started on http://%s:%d", conf['host'], conf['port'])
+    log.info("Endpoints: POST /info, POST /get")
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await runner.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(main())
