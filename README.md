@@ -2,6 +2,11 @@
 
 Client-server tool to retrieve logs from multiple servers, both standalone and running as pods across all K8s cluster workers.
 
+## Description
+
+Kulogs is a client/server tool that allows you to collect logs from multiple application instances over a specified time period.
+It is particularly useful in Kubernetes environments, where you can retrieve logs for an application’s pod even if that pod has already been removed from the node.
+
 ## Installation
 
 Requires Python 3.7+
