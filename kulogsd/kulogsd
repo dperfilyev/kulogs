@@ -111,9 +111,14 @@ async def handle_get(request):
     await response.prepare(request)
 
     file_info_res = {}
-    for pattern in [conf['pods_dir']+'/'+data['ns']+'_'+data['pod_prefix']+'*/*/[0-9]*.log',
-                    conf['pods_dir']+'/'+data['ns']+'_'+data['pod_prefix']+'*/*/[0-9]*.log.[0-9]*-*[0-9]',  #0.log.20260904-142556
-                    conf['pods_dir']+'/'+data['ns']+'_'+data['pod_prefix']+'*/*/[0-9]*.log.[0-9]*-*[0-9].gz']: #0.log.20260904-142556.gz
+
+    container_name = '*'
+    if 'container_name' in data :
+       container_name = data['container_name']
+
+    for pattern in [conf['pods_dir']+'/'+data['ns']+'_'+data['pod_prefix']+'*/'+container_name+'/[0-9]*.log',
+                    conf['pods_dir']+'/'+data['ns']+'_'+data['pod_prefix']+'*/'+container_name+'/[0-9]*.log.[0-9]*-*[0-9]',  #0.log.20260904-142556
+                    conf['pods_dir']+'/'+data['ns']+'_'+data['pod_prefix']+'*/'+container_name+'/[0-9]*.log.[0-9]*-*[0-9].gz']: #0.log.20260904-142556.gz
       for file_path in glob.glob(pattern):
         f,t = get_first_and_last_epoch_with_cache(file_path) 
         matched = True

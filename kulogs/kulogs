@@ -208,6 +208,12 @@ async def main():
     parser = argparse.ArgumentParser( description="Collect pod's logs")
 
     parser.add_argument(
+        "-c", "--container_name",
+        type=str,
+        help="Container name in pod. Default '*'"
+    )
+
+    parser.add_argument(
         "-e", "--end_time", 
         type=parse_end_time,
         help="End time (Cannot be used without --start-time.) 'YYYY-MM-DD [HH42[:MI[:SS]]]'"
@@ -260,6 +266,10 @@ async def main():
         "pod_prefix": args.pod_prefix ,
         "extra_param": "test_value",
     }
+
+    if args.container_name :
+       payload['container_name'] = args.container_name
+
     if args.end_time :
        if args.start_time :
          payload['end_time'] = int(args.end_time.timestamp())
