@@ -138,7 +138,8 @@ async def fetch_from_server( session, name, base_url,
 
 async def request_all_servers( servers, endpoint, payload, timeout):
     connector = aiohttp.TCPConnector(limit=100)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    # TODO line limit 2 * read_bufsize
+    async with aiohttp.ClientSession(connector=connector, read_bufsize=1024 * 1024) as session:
         tasks = [
             fetch_from_server(
                 session,
